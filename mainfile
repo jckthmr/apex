@@ -1,0 +1,1960 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  Flame, Zap, Check, Trophy, BarChart3, ListChecks, Plus, X, Sun, Moon, Lock,
+  Clock, Pencil, Trash2, Snowflake, Sparkles, ChevronLeft, ChevronRight,
+  Target, CalendarDays, Repeat
+} from "lucide-react";
+
+/* ============================================================================
+   APEX — a training log for the day.
+   Single-file app: timetable, habits, XP, levels, streaks, 115 achievements,
+   stats and an end-of-day review. State persists via window.storage.
+   ========================================================================== */
+
+/* ---------------------------------- theme -------------------------------- */
+
+const THEMES = {
+  dark: {
+    bg: "#10141D", panel: "#19202D", panel2: "#212B3B", line: "#2E394C",
+    text: "#E8EDF6", dim: "#93A0B5", faint: "#63718A", shadow: "0 18px 40px -24px rgba(0,0,0,.9)",
+  },
+  light: {
+    bg: "#EDF0F5", panel: "#FFFFFF", panel2: "#F4F6FA", line: "#DCE2EC",
+    text: "#131926", dim: "#5A6678", faint: "#8B96A8", shadow: "0 18px 40px -28px rgba(19,25,38,.35)",
+  },
+};
+const XP_C = "#FFB020", EMBER = "#FF5A36", ICE = "#56CCF2", MINT = "#35D0A5";
+
+const CATEGORIES = {
+  Revision: "#7C9CFF",
+  Training: "#FF7A59",
+  School: "#B08BFF",
+  Recovery: "#35D0A5",
+  Life: "#FFC857",
+  Focus: "#56CCF2",
+};
+const CAT_KEYS = Object.keys(CATEGORIES);
+
+const DIFFICULTY = { easy: 10, medium: 25, hard: 50 };
+const EXTRA_BONUS = 100;      // paid on top for each optional session cleared
+const GOAL_BONUS = 100;       // paid the moment a weekly goal reaches its target
+const ALL_GOALS_BONUS = 250;  // paid when every weekly goal is met
+const DIFF_KEYS = ["easy", "medium", "hard"];
+
+const RARITIES = ["common", "uncommon", "rare", "epic", "legendary", "mythic"];
+const RARITY_C = {
+  common: "#8B96A8", uncommon: "#35D0A5", rare: "#56CCF2",
+  epic: "#B08BFF", legendary: "#FFB020", mythic: "#FF4D6D",
+};
+const RARITY_XP = [25, 50, 100, 200, 400, 800];
+
+/* --------------------------------- levels -------------------------------- */
+
+// XP required to advance from level L to L+1.
+const xpToNext = (L) => Math.round(60 * Math.pow(L, 1.2)) + 100;
+
+const CUM = (() => {
+  const arr = [0, 0]; // index = level, value = total XP needed to reach it
+  for (let L = 1; L <= 120; L++) arr[L + 1] = arr[L] + xpToNext(L);
+  return arr;
+})();
+
+function levelFromXp(xp) {
+  let L = 1;
+  while (L < 100 && xp >= CUM[L + 1]) L++;
+  const floorXp = CUM[L], ceilXp = L >= 100 ? CUM[100] : CUM[L + 1];
+  const span = Math.max(1, ceilXp - floorXp);
+  return {
+    level: L,
+    into: Math.max(0, xp - floorXp),
+    need: span,
+    pct: L >= 100 ? 100 : Math.min(100, ((xp - floorXp) / span) * 100),
+  };
+}
+
+const RANKS = [
+  [1, "Beginner"], [3, "Starter"], [5, "Consistent"], [8, "Steady"],
+  [10, "Disciplined"], [14, "Committed"], [20, "Focused"], [25, "Relentless"],
+  [30, "Elite"], [40, "Formidable"], [50, "Master"], [60, "Peerless"],
+  [75, "Legend"], [90, "Mythic"], [100, "Apex"],
+];
+const rankFor = (lvl) => RANKS.filter(([m]) => lvl >= m).pop()[1];
+
+/* ---------------------------------- dates -------------------------------- */
+
+const pad = (n) => String(n).padStart(2, "0");
+const keyOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const todayKey = () => keyOf(new Date());
+const parseKey = (k) => { const [y, m, d] = k.split("-").map(Number); return new Date(y, m - 1, d); };
+const shiftKey = (k, n) => { const d = parseKey(k); d.setDate(d.getDate() + n); return keyOf(d); };
+const dowOf = (k) => (parseKey(k).getDay() + 6) % 7; // 0 = Monday
+const DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const toMin = (t) => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
+const fmtTime = (t) => t;
+const prettyDate = (k) =>
+  parseKey(k).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long" });
+
+/* --------------------------------- defaults ------------------------------ */
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+const WEEKDAYS = [0, 1, 2, 3, 4];
+const SCHOOL_DAYS = [0, 1, 2, 3]; // Mon–Thu carry the full revision evening
+const GYM_DAYS = [0, 1, 3];       // Wednesday is football, Friday is rest
+const WEEKEND = [5, 6];
+
+const DEFAULT_SCHEDULE = [
+  { id: "r1", name: "Revision 1", start: "16:45", end: "17:10", category: "Revision", difficulty: "medium", must: true, optional: false, days: SCHOOL_DAYS },
+  { id: "r2", name: "Revision 2", start: "17:15", end: "17:40", category: "Revision", difficulty: "medium", must: true, optional: false, days: SCHOOL_DAYS },
+  { id: "r3", name: "Revision 3", start: "17:45", end: "18:10", category: "Revision", difficulty: "medium", must: true, optional: false, days: SCHOOL_DAYS },
+  { id: "r4", name: "Revision 4", start: "18:15", end: "18:40", category: "Revision", difficulty: "medium", must: true, optional: false, days: GYM_DAYS },
+  { id: "fb", name: "Football", start: "18:30", end: "20:00", category: "Training", difficulty: "hard", must: false, optional: false, days: [2] },
+  { id: "gy", name: "Gym", start: "19:15", end: "20:30", category: "Training", difficulty: "hard", must: false, optional: false, days: GYM_DAYS },
+  { id: "r5", name: "Revision 5", start: "20:30", end: "20:55", category: "Revision", difficulty: "hard", must: false, optional: true, days: SCHOOL_DAYS },
+  { id: "fr", name: "Revision", start: "16:45", end: "17:15", category: "Revision", difficulty: "hard", must: false, optional: true, days: [4] },
+  { id: "fg", name: "Gym", anytime: true, minutes: 75, category: "Training", difficulty: "hard", must: false, optional: false, days: [4] },
+  // Weekend work floats — no fixed slot, just a duration to be found somewhere in the day.
+  { id: "w1", name: "Revision 1", anytime: true, minutes: 50, category: "Revision", difficulty: "hard", must: true, optional: false, days: WEEKEND },
+  { id: "w2", name: "Revision 2", anytime: true, minutes: 50, category: "Revision", difficulty: "hard", must: true, optional: false, days: WEEKEND },
+  { id: "w3", name: "Revision 3", anytime: true, minutes: 50, category: "Revision", difficulty: "hard", must: true, optional: false, days: WEEKEND },
+  { id: "wg", name: "Gym", anytime: true, minutes: 75, category: "Training", difficulty: "hard", must: false, optional: false, days: WEEKEND },
+];
+
+const DEFAULT_GOALS = [
+  { id: "g1", name: "Cardio", category: "Training", difficulty: "hard", target: 3, minMinutes: 45 },
+  { id: "g2", name: "Abs", category: "Training", difficulty: "medium", target: 2, minMinutes: 0 },
+  { id: "g3", name: "Wash bed sheets", category: "Life", difficulty: "easy", target: 1, minMinutes: 0 },
+];
+
+const DEFAULT_HABITS = [
+  { id: "h1", name: "Up at 7:00, no phone", category: "Recovery", difficulty: "easy", days: WEEKDAYS },
+  { id: "h2", name: "Ready before phone at 7:30", category: "Life", difficulty: "easy", days: WEEKDAYS },
+  { id: "h3", name: "Phone down at 21:15", category: "Recovery", difficulty: "easy", days: WEEKDAYS },
+  { id: "h4", name: "Asleep by 22:00", category: "Recovery", difficulty: "easy", days: WEEKDAYS },
+];
+
+// Bumped whenever the authored plan changes, so a saved state picks up the new one.
+const PLAN_REV = 5;
+
+const DEFAULT_STATE = {
+  v: 3,
+  planRev: PLAN_REV,
+  theme: "dark",
+  sampleData: false,
+  schedule: DEFAULT_SCHEDULE,
+  habits: DEFAULT_HABITS,
+  goals: DEFAULT_GOALS,
+  log: {},        // dateKey -> { planned, tasks: {id:{t,xp,min,cat,start}}, habits: {id:{t,xp,cat}}, note }
+  freezes: {},    // dateKey -> true
+  seen: [],       // achievement ids already celebrated
+  createdAt: new Date().toISOString(),
+};
+
+/* ------------------------------ achievements ----------------------------- */
+
+function fam(prefix, metric, thresholds, name, desc, group) {
+  return thresholds.map((n, i) => {
+    const r = Math.min(i, 5);
+    return {
+      id: `${prefix}_${n}`, metric, target: n, group,
+      name: name(n), desc: desc(n), rarity: RARITIES[r], xp: RARITY_XP[r],
+    };
+  });
+}
+
+const ACHIEVEMENTS = [
+  ...fam("streak", "bestStreak", [3, 7, 14, 30, 60, 100, 180, 365],
+    (n) => n >= 365 ? "Diamond year" : n >= 100 ? "Gold hundred" : n >= 30 ? "Silver month" : n >= 7 ? "Bronze week" : "Three in a row",
+    (n) => `Hold a ${n}-day streak`, "Streaks"),
+  ...fam("perfect", "perfectDays", [1, 5, 10, 25, 50, 100, 200],
+    (n) => n === 1 ? "Clean sheet" : `${n} perfect days`,
+    (n) => `Finish every planned item on ${n} ${n === 1 ? "day" : "days"}`, "Perfect days"),
+  ...fam("tasks", "tasksDone", [1, 10, 50, 100, 250, 500, 1000, 2500, 5000],
+    (n) => n === 1 ? "First rep" : `${n.toLocaleString()} sessions`,
+    (n) => `Complete ${n.toLocaleString()} scheduled ${n === 1 ? "session" : "sessions"}`, "Volume"),
+  ...fam("xp", "baseXp", [100, 500, 1000, 5000, 10000, 25000, 50000, 100000, 250000, 500000],
+    (n) => `${n.toLocaleString()} XP`,
+    (n) => `Earn ${n.toLocaleString()} XP from sessions and habits`, "XP"),
+  ...fam("level", "baseLevel", [2, 5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 90, 100],
+    (n) => `${rankFor(n)} · level ${n}`,
+    (n) => `Reach level ${n}`, "Levels"),
+  ...fam("habitstreak", "habitBestStreak", [7, 30, 100, 365],
+    (n) => `Habit held ${n} days`,
+    (n) => `Keep a single habit alive for ${n} days`, "Habits"),
+  ...fam("week", "perfectWeeks", [1, 4, 12, 26, 52],
+    (n) => n === 1 ? "Perfect week" : `${n} perfect weeks`,
+    (n) => `Complete ${n} full ${n === 1 ? "week" : "weeks"} without a miss`, "Perfect days"),
+  ...fam("active", "daysActive", [7, 30, 90, 180, 365, 730],
+    (n) => `${n} days logged`,
+    (n) => `Log activity on ${n} separate days`, "Consistency"),
+  ...fam("hours", "hours", [10, 50, 100, 250, 500, 1000],
+    (n) => `${n} hours down`,
+    (n) => `Bank ${n} productive hours`, "Volume"),
+  ...fam("burst", "maxTasksInDay", [5, 8, 12, 16, 20],
+    (n) => `${n} in a day`,
+    (n) => `Complete ${n} sessions in a single day`, "Volume"),
+  ...fam("early", "earlyTasks", [1, 10, 50, 150],
+    (n) => n === 1 ? "Before the alarm" : `${n} dawn sessions`,
+    (n) => `Complete ${n} ${n === 1 ? "session" : "sessions"} starting before 07:00`, "Timing"),
+  ...fam("late", "lateTasks", [1, 10, 50, 150],
+    (n) => n === 1 ? "Late shift" : `${n} late sessions`,
+    (n) => `Complete ${n} ${n === 1 ? "session" : "sessions"} starting after 21:30`, "Timing"),
+  ...fam("weekend", "weekendPerfect", [1, 5, 15, 40],
+    (n) => n === 1 ? "Weekend held" : `${n} perfect weekends`,
+    (n) => `Finish a perfect Saturday or Sunday ${n} ${n === 1 ? "time" : "times"}`, "Timing"),
+  ...fam("comeback", "comebacks", [1, 5, 15],
+    (n) => n === 1 ? "Back on it" : `${n} comebacks`,
+    (n) => `Restart the day after a miss, ${n} ${n === 1 ? "time" : "times"}`, "Consistency"),
+  ...fam("habits", "habitsDone", [1, 25, 100, 500, 1500],
+    (n) => n === 1 ? "First habit ticked" : `${n} habits ticked`,
+    (n) => `Tick off ${n} ${n === 1 ? "habit" : "habits"}`, "Habits"),
+  ...fam("extra", "extraSessions", [1, 25, 100, 300],
+    (n) => n === 1 ? "Went beyond" : `${n} extra sessions`,
+    (n) => `Clear ${n} optional ${n === 1 ? "session" : "sessions"} on top of the plan`, "Volume"),
+  ...fam("goal", "goalTargets", [1, 10, 40, 120, 300],
+    (n) => n === 1 ? "Target met" : `${n} weekly targets`,
+    (n) => `Hit a weekly goal target ${n} ${n === 1 ? "time" : "times"}`, "Weekly goals"),
+  ...fam("goalweek", "goalWeeks", [1, 4, 12, 26, 52],
+    (n) => n === 1 ? "Full set" : `${n} complete weeks`,
+    (n) => `Meet every weekly goal for ${n} ${n === 1 ? "week" : "weeks"}`, "Weekly goals"),
+  ...fam("goalhit", "goalsHit", [1, 25, 100, 400],
+    (n) => n === 1 ? "First one logged" : `${n} goal sessions`,
+    (n) => `Log ${n} weekly-goal ${n === 1 ? "session" : "sessions"}`, "Weekly goals"),
+  ...fam("bigday", "bestDayXp", [200, 500, 1000, 2000],
+    (n) => `${n} XP in one day`,
+    (n) => `Earn ${n} XP in a single day`, "XP"),
+  ...CAT_KEYS.flatMap((c) =>
+    fam(`cat_${c}`, `cat:${c}`, [25, 100, 300],
+      (n) => `${c} · ${n}`,
+      (n) => `Complete ${n} ${c} sessions`, "Categories")
+  ),
+];
+
+const ACH_BY_GROUP = ACHIEVEMENTS.reduce((acc, a) => {
+  (acc[a.group] = acc[a.group] || []).push(a);
+  return acc;
+}, {});
+
+/* ---------------------------------- ledger -------------------------------- */
+/* Everything is recomputed from the log, so totals can never drift out of sync
+   with what actually got ticked. */
+
+const streakMult = (streak) => 1 + Math.min(streak, 30) * 0.02; // caps at 1.60x
+
+// Untimed sessions carry a duration instead of a start and end, and sort to the bottom.
+const durationOf = (t) => t.anytime
+  ? (t.minutes || 0)
+  : Math.max(0, toMin(t.end) - toMin(t.start));
+
+function tasksForDate(schedule, key) {
+  const d = dowOf(key);
+  return schedule.filter((t) => t.days.includes(d)).sort((a, b) => {
+    if (!a.anytime !== !b.anytime) return a.anytime ? 1 : -1;
+    if (a.anytime) return 0;
+    return toMin(a.start) - toMin(b.start);
+  });
+}
+function habitsForDate(habits, key) {
+  const d = dowOf(key);
+  return habits.filter((h) => h.days.includes(d));
+}
+// Optional sessions pay XP but never count against you, so they sit outside the plan.
+const coreCount = (schedule, key) => tasksForDate(schedule, key).filter((t) => !t.optional).length;
+
+// Weekly goals are a count per week with no fixed day. Weeks run Monday to Sunday.
+const weekStartOf = (key) => shiftKey(key, -dowOf(key));
+
+function weekGoalCounts(state, key) {
+  const ws = weekStartOf(key), counts = {};
+  for (let i = 0; i < 7; i++) {
+    const e = state.log[shiftKey(ws, i)];
+    if (!e || !e.goals) continue;
+    Object.keys(e.goals).forEach((id) => {
+      if (e.goals[id].ok !== false) counts[id] = (counts[id] || 0) + 1;
+    });
+  }
+  return counts;
+}
+
+function buildLedger(state) {
+  const logKeys = Object.keys(state.log).sort();
+  const today = todayKey();
+  const start = logKeys.length ? logKeys[0] : today;
+
+  const days = [];
+  const st = {
+    baseXp: 0, tasksDone: 0, habitsDone: 0, perfectDays: 0, perfectWeeks: 0,
+    daysActive: 0, minutes: 0, maxTasksInDay: 0, earlyTasks: 0, lateTasks: 0,
+    weekendPerfect: 0, comebacks: 0, bestDayXp: 0, bestStreak: 0, streak: 0,
+    freezesUsed: 0, missed: 0, extraSessions: 0, goalsHit: 0, goalTargets: 0, goalWeeks: 0,
+  };
+  CAT_KEYS.forEach((c) => { st[`cat:${c}`] = 0; });
+
+  const goalDefs = state.goals || [];
+  let curWeek = null, weekCount = {}, weekAwarded = {};
+  let streak = 0, prevQualified = true, hadStreak = 0;
+  let cursor = start;
+  let guard = 0;
+
+  while (guard++ < 4000) {
+    const entry = state.log[cursor] || null;
+    const planned = entry && typeof entry.planned === "number"
+      ? entry.planned : coreCount(state.schedule, cursor);
+    const tasks = (entry && entry.tasks) || {};
+    const habits = (entry && entry.habits) || {};
+    const goals = (entry && entry.goals) || {};
+    const goalIds = Object.keys(goals);
+    const taskIds = Object.keys(tasks), habitIds = Object.keys(habits);
+
+    const wk = weekStartOf(cursor);
+    if (wk !== curWeek) { curWeek = wk; weekCount = {}; weekAwarded = {}; }
+    const doneCount = taskIds.filter((id) => !tasks[id].opt).length;
+    const doneExtra = taskIds.length - doneCount;
+    const habitCount = habitIds.length;
+
+    const rawTaskXp = taskIds.reduce((s, id) => s + (tasks[id].xp || 0), 0);
+    const rawHabitXp = habitIds.reduce((s, id) => s + (habits[id].xp || 0), 0);
+    const rawGoalXp = goalIds.reduce((s, id) => s + (goals[id].xp || 0), 0);
+    const mult = streakMult(streak);
+    let total = Math.round((rawTaskXp + rawHabitXp + rawGoalXp) * mult);
+
+    const offPlanWork = habitCount + goalIds.length;
+    const rate = planned > 0 ? doneCount / planned : (offPlanWork > 0 ? 1 : 0);
+    const qualified = doneCount + offPlanWork > 0 && rate >= 0.6;
+    const frozen = !qualified && !!state.freezes[cursor];
+
+    const habitsPlanned = habitsForDate(state.habits, cursor).length;
+    const perfect = planned >= 3 && doneCount >= planned &&
+      (habitsPlanned === 0 || habitCount >= habitsPlanned);
+
+    const bonuses = [];
+    if (doneExtra > 0) {
+      const xp = EXTRA_BONUS * doneExtra;
+      bonuses.push({ label: doneExtra > 1 ? `${doneExtra} extra sessions` : "Extra session", xp });
+      total += xp;
+    }
+    if (perfect) { bonuses.push({ label: "Perfect day", xp: 250 }); total += 250; }
+
+    goalIds.forEach((id) => { if (goals[id].ok !== false) weekCount[id] = (weekCount[id] || 0) + 1; });
+    goalDefs.forEach((g) => {
+      if (!weekAwarded[g.id] && (weekCount[g.id] || 0) >= g.target) {
+        weekAwarded[g.id] = true;
+        bonuses.push({ label: `${g.name} target hit`, xp: GOAL_BONUS });
+        total += GOAL_BONUS;
+        st.goalTargets++;
+      }
+    });
+    if (goalDefs.length && !weekAwarded.__all && goalDefs.every((g) => weekAwarded[g.id])) {
+      weekAwarded.__all = true;
+      bonuses.push({ label: "Every weekly goal met", xp: ALL_GOALS_BONUS });
+      total += ALL_GOALS_BONUS;
+      st.goalWeeks++;
+    }
+
+    // A day with nothing on it is a rest day, not a failure: it holds the streak
+    // without extending it.
+    const neutral = planned === 0 && habitsPlanned === 0 &&
+      taskIds.length + habitCount + goalIds.length === 0;
+
+    if (neutral) {
+      // carry the streak through untouched
+    } else if (qualified) {
+      if (!prevQualified && hadStreak >= 3) st.comebacks++;
+      streak++;
+      st.daysActive++;
+    } else if (frozen) {
+      st.freezesUsed++;
+    } else {
+      if (cursor !== today || taskIds.length + offPlanWork > 0) st.missed++;
+      streak = 0;
+    }
+    hadStreak = Math.max(hadStreak, streak);
+    st.bestStreak = Math.max(st.bestStreak, streak);
+
+    // Perfect week bonus lands on Sunday.
+    if (dowOf(cursor) === 6) {
+      const week = [...days.slice(-6), { qualified, neutral }];
+      const active = week.filter((d) => !d.neutral);
+      const full = week.length === 7 && active.length >= 4 && active.every((d) => d.qualified);
+      if (full) { bonuses.push({ label: "Perfect week", xp: 500 }); total += 500; st.perfectWeeks++; }
+    }
+
+    st.baseXp += total;
+    st.tasksDone += taskIds.length;
+    st.extraSessions += doneExtra;
+    st.goalsHit += goalIds.length;
+    goalIds.forEach((id) => {
+      st.minutes += goals[id].min || 0;
+      if (goals[id].cat && st[`cat:${goals[id].cat}`] !== undefined) st[`cat:${goals[id].cat}`]++;
+    });
+    st.habitsDone += habitCount;
+    st.bestDayXp = Math.max(st.bestDayXp, total);
+    st.maxTasksInDay = Math.max(st.maxTasksInDay, taskIds.length);
+    if (perfect) {
+      st.perfectDays++;
+      if (dowOf(cursor) >= 5) st.weekendPerfect++;
+    }
+    taskIds.forEach((id) => {
+      const t = tasks[id];
+      st.minutes += t.min || 0;
+      if (t.cat && st[`cat:${t.cat}`] !== undefined) st[`cat:${t.cat}`]++;
+      if (t.start) {
+        const m = toMin(t.start);
+        if (m < 420) st.earlyTasks++;
+        if (m >= 1290) st.lateTasks++;
+      }
+    });
+
+    days.push({
+      key: cursor, planned, doneCount, doneExtra, habitCount, habitsPlanned, goalCount: goalIds.length, rate, qualified,
+      neutral, frozen, perfect, total, mult, bonuses, rawTaskXp, rawHabitXp, streakAfter: streak,
+    });
+
+    if (!neutral) prevQualified = qualified || frozen;
+    if (cursor === today) break;
+    cursor = shiftKey(cursor, 1);
+    if (parseKey(cursor) > parseKey(today)) break;
+  }
+
+  // Longest single-habit run.
+  let habitBest = 0;
+  state.habits.forEach((h) => {
+    let run = 0, best = 0;
+    days.forEach((d) => {
+      const e = state.log[d.key];
+      const scheduled = h.days.includes(dowOf(d.key));
+      if (!scheduled) return;
+      if (e && e.habits && e.habits[h.id]) { run++; best = Math.max(best, run); }
+      else if (d.key !== todayKey()) run = 0;
+    });
+    habitBest = Math.max(habitBest, best);
+  });
+
+  st.habitBestStreak = habitBest;
+  st.hours = Math.floor(st.minutes / 60);
+  st.streak = streak;
+  st.baseLevel = levelFromXp(st.baseXp).level;
+
+  const earnedFreezes = Math.min(3, Math.floor(st.daysActive / 7) - st.freezesUsed);
+  st.freezesAvailable = Math.max(0, earnedFreezes);
+
+  // Achievements evaluate against base progress, then pay out on top.
+  const unlocked = ACHIEVEMENTS.filter((a) => (st[a.metric] || 0) >= a.target);
+  const achXp = unlocked.reduce((s, a) => s + a.xp, 0);
+  const totalXp = st.baseXp + achXp;
+
+  return { days, stats: st, unlocked, unlockedIds: unlocked.map((a) => a.id), achXp, totalXp };
+}
+
+/* --------------------------------- storage ------------------------------- */
+
+const KEY = "apex:state:v3";
+
+async function loadState() {
+  try {
+    const r = await window.storage.get(KEY);
+    if (r && r.value) {
+      const saved = JSON.parse(r.value);
+      const merged = { ...DEFAULT_STATE, ...saved };
+      // A saved schedule would otherwise shadow every later edit to the plan.
+      if ((saved.planRev || 0) < PLAN_REV) {
+        merged.schedule = DEFAULT_SCHEDULE;
+        merged.habits = DEFAULT_HABITS;
+        merged.goals = DEFAULT_GOALS;
+        merged.planRev = PLAN_REV;
+      }
+      return merged;
+    }
+  } catch (e) { /* first run, or storage unavailable */ }
+  return null;
+}
+async function saveState(s) {
+  try { await window.storage.set(KEY, JSON.stringify(s)); } catch (e) { /* offline is fine */ }
+}
+
+/* ------------------------------ small pieces ----------------------------- */
+
+function Bar({ pct, color, height = 8, track }) {
+  return (
+    <div style={{ background: track, borderRadius: 99, height, overflow: "hidden" }}>
+      <div style={{
+        width: `${Math.max(0, Math.min(100, pct))}%`, height: "100%", background: color,
+        borderRadius: 99, transition: "width .5s cubic-bezier(.2,.9,.3,1)",
+      }} />
+    </div>
+  );
+}
+
+function Stat({ label, value, sub, color, C }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 14, padding: "14px 14px 12px" }}>
+      <div className="apex-num" style={{ fontSize: 26, color: color || C.text, lineHeight: 1 }}>{value}</div>
+      <div style={{ fontSize: 12, color: C.dim, marginTop: 6 }}>{label}</div>
+      {sub && <div style={{ fontSize: 11, color: C.faint, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function Sheet({ open, onClose, title, children, C }) {
+  if (!open) return null;
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(6,9,14,.62)", zIndex: 60,
+        display: "flex", alignItems: "flex-end", justifyContent: "center",
+        backdropFilter: "blur(3px)",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="apex-rise"
+        style={{
+          background: C.panel, borderTop: `1px solid ${C.line}`, width: "100%", maxWidth: 560,
+          borderRadius: "20px 20px 0 0", padding: 18, maxHeight: "88vh", overflowY: "auto",
+          boxShadow: C.shadow,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+          <h2 className="apex-num" style={{ fontSize: 20, color: C.text, margin: 0 }}>{title}</h2>
+          <button onClick={onClose} aria-label="Close"
+            style={{ background: C.panel2, border: `1px solid ${C.line}`, color: C.dim, borderRadius: 10, padding: 7, cursor: "pointer" }}>
+            <X size={16} />
+          </button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, children, C }) {
+  return (
+    <label style={{ display: "block", marginBottom: 14 }}>
+      <div style={{ fontSize: 12, color: C.dim, marginBottom: 6 }}>{label}</div>
+      {children}
+    </label>
+  );
+}
+
+function Chip({ active, onClick, color, children, C, small }) {
+  return (
+    <button onClick={onClick} style={{
+      background: active ? (color || C.text) : C.panel2,
+      color: active ? (color ? "#0F1420" : C.bg) : C.dim,
+      border: `1px solid ${active ? (color || C.text) : C.line}`,
+      borderRadius: 99, padding: small ? "5px 10px" : "7px 13px",
+      fontSize: small ? 11 : 13, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap",
+    }}>{children}</button>
+  );
+}
+
+/* --------------------------------- the app ------------------------------- */
+
+export default function ApexApp() {
+  const [state, setState] = useState(DEFAULT_STATE);
+  const [ready, setReady] = useState(false);
+  const [tab, setTab] = useState("today");
+  const [viewKey, setViewKey] = useState(todayKey());
+  const [toasts, setToasts] = useState([]);
+  const [levelUp, setLevelUp] = useState(null);
+  const [editTask, setEditTask] = useState(null);
+  const [editHabit, setEditHabit] = useState(null);
+  const [editGoal, setEditGoal] = useState(null);
+  const [logGoalFor, setLogGoalFor] = useState(null);
+  const prevLevel = useRef(null);
+
+  useEffect(() => {
+    let live = true;
+    loadState().then((s) => {
+      if (!live) return;
+      if (s) setState(s);
+      setReady(true);
+    });
+    return () => { live = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    const t = setTimeout(() => saveState(state), 350);
+    return () => clearTimeout(t);
+  }, [state, ready]);
+
+  const C = THEMES[state.theme];
+  const ledger = useMemo(() => buildLedger(state), [state]);
+  const lvl = levelFromXp(ledger.totalXp);
+  const today = todayKey();
+
+  // Celebrate new achievements and level-ups.
+  useEffect(() => {
+    if (!ready) return;
+    const fresh = ledger.unlockedIds.filter((id) => !state.seen.includes(id));
+    if (fresh.length) {
+      const items = fresh.map((id) => ACHIEVEMENTS.find((a) => a.id === id)).filter(Boolean);
+      setToasts((t) => [...t, ...items.map((a) => ({ key: uid(), ach: a }))]);
+      setState((s) => ({ ...s, seen: [...s.seen, ...fresh] }));
+    }
+    if (prevLevel.current !== null && lvl.level > prevLevel.current) setLevelUp(lvl.level);
+    prevLevel.current = lvl.level;
+  }, [ledger.unlockedIds.join(","), lvl.level, ready]);
+
+  useEffect(() => {
+    if (!toasts.length) return;
+    const t = setTimeout(() => setToasts((x) => x.slice(1)), 3200);
+    return () => clearTimeout(t);
+  }, [toasts]);
+
+  /* ------------------------------- actions ------------------------------- */
+
+  const patchDay = useCallback((key, fn) => {
+    setState((s) => {
+      const cur = s.log[key] || { planned: coreCount(s.schedule, key), tasks: {}, habits: {}, goals: {}, note: "" };
+      const next = fn({ ...cur, tasks: { ...cur.tasks }, habits: { ...cur.habits }, goals: { ...(cur.goals || {}) } }, s);
+      return { ...s, log: { ...s.log, [key]: next } };
+    });
+  }, []);
+
+  const toggleTask = (key, task) => {
+    patchDay(key, (day) => {
+      if (day.tasks[task.id]) { delete day.tasks[task.id]; return day; }
+      day.tasks[task.id] = {
+        t: new Date().toISOString(),
+        xp: DIFFICULTY[task.difficulty],
+        min: durationOf(task),
+        cat: task.category, start: task.anytime ? null : task.start, opt: !!task.optional,
+      };
+      return day;
+    });
+  };
+
+  const toggleHabit = (key, habit) => {
+    patchDay(key, (day) => {
+      if (day.habits[habit.id]) { delete day.habits[habit.id]; return day; }
+      day.habits[habit.id] = {
+        t: new Date().toISOString(), xp: DIFFICULTY[habit.difficulty], cat: habit.category,
+      };
+      return day;
+    });
+  };
+
+  const logGoal = (key, goal, minutes) => {
+    patchDay(key, (day) => {
+      if (day.goals[goal.id]) { delete day.goals[goal.id]; return day; }
+      const min = minutes || 0;
+      day.goals[goal.id] = {
+        t: new Date().toISOString(), xp: DIFFICULTY[goal.difficulty], min,
+        cat: goal.category, ok: min >= (goal.minMinutes || 0),
+      };
+      return day;
+    });
+    setLogGoalFor(null);
+  };
+  const saveGoal = (g) => {
+    setState((s) => {
+      const list = s.goals || [];
+      const exists = list.some((x) => x.id === g.id);
+      return { ...s, goals: exists ? list.map((x) => (x.id === g.id ? g : x)) : [...list, g] };
+    });
+    setEditGoal(null);
+  };
+  const deleteGoal = (id) => {
+    setState((s) => ({ ...s, goals: (s.goals || []).filter((x) => x.id !== id) }));
+    setEditGoal(null);
+  };
+
+  const saveTask = (task) => {
+    setState((s) => {
+      const exists = s.schedule.some((t) => t.id === task.id);
+      return {
+        ...s, sampleData: false,
+        schedule: exists ? s.schedule.map((t) => (t.id === task.id ? task : t)) : [...s.schedule, task],
+      };
+    });
+    setEditTask(null);
+  };
+  const deleteTask = (id) => {
+    setState((s) => ({ ...s, schedule: s.schedule.filter((t) => t.id !== id) }));
+    setEditTask(null);
+  };
+  const saveHabit = (h) => {
+    setState((s) => {
+      const exists = s.habits.some((x) => x.id === h.id);
+      return { ...s, habits: exists ? s.habits.map((x) => (x.id === h.id ? h : x)) : [...s.habits, h] };
+    });
+    setEditHabit(null);
+  };
+  const deleteHabit = (id) => {
+    setState((s) => ({ ...s, habits: s.habits.filter((x) => x.id !== id) }));
+    setEditHabit(null);
+  };
+  const useFreeze = (key) => setState((s) => ({ ...s, freezes: { ...s.freezes, [key]: true } }));
+  const toggleTheme = () => setState((s) => ({ ...s, theme: s.theme === "dark" ? "light" : "dark" }));
+
+  if (!ready) {
+    return (
+      <div style={{ background: C.bg, minHeight: "100vh", display: "grid", placeItems: "center", color: C.dim }}>
+        <div style={{ fontSize: 13 }}>Loading your log…</div>
+      </div>
+    );
+  }
+
+  const TABS = [
+    { id: "today", label: "Today", Icon: ListChecks },
+    { id: "habits", label: "Routine", Icon: Repeat },
+    { id: "stats", label: "Stats", Icon: BarChart3 },
+    { id: "awards", label: "Awards", Icon: Trophy },
+    { id: "review", label: "Review", Icon: Target },
+  ];
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", color: C.text, fontFamily: "Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" }}>
+      <Styles />
+      <div style={{ maxWidth: 560, margin: "0 auto", padding: "0 14px 108px" }}>
+        <Header C={C} lvl={lvl} totalXp={ledger.totalXp} streak={ledger.stats.streak}
+          theme={state.theme} onTheme={toggleTheme} />
+
+        {tab === "today" && (
+          <TodayScreen
+            C={C} state={state} ledger={ledger} viewKey={viewKey} setViewKey={setViewKey}
+            onToggle={toggleTask} onEdit={setEditTask} onAdd={() => setEditTask(newTask())}
+            onFreeze={useFreeze} onToggleHabit={toggleHabit}
+            onGoal={(g) => (g.minMinutes > 0 && !(state.log[todayKey()] || {}).goals?.[g.id]
+              ? setLogGoalFor(g) : logGoal(todayKey(), g, g.minMinutes || 0))}
+          />
+        )}
+        {tab === "habits" && (
+          <HabitsScreen C={C} state={state} ledger={ledger} onToggle={toggleHabit}
+            onEdit={setEditHabit} onAdd={() => setEditHabit(newHabit())}
+            onEditGoal={setEditGoal} onAddGoal={() => setEditGoal(newGoal())}
+            onGoal={(g) => (g.minMinutes > 0 && !(state.log[todayKey()] || {}).goals?.[g.id]
+              ? setLogGoalFor(g) : logGoal(todayKey(), g, g.minMinutes || 0))} />
+        )}
+        {tab === "stats" && <StatsScreen C={C} state={state} ledger={ledger} lvl={lvl} />}
+        {tab === "awards" && <AwardsScreen C={C} ledger={ledger} />}
+        {tab === "review" && <ReviewScreen C={C} state={state} ledger={ledger} setState={setState} />}
+      </div>
+
+      <nav style={{
+        position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 40,
+        background: state.theme === "dark" ? "rgba(16,20,29,.92)" : "rgba(255,255,255,.94)",
+        borderTop: `1px solid ${C.line}`, backdropFilter: "blur(14px)",
+      }}>
+        <div style={{ maxWidth: 560, margin: "0 auto", display: "grid", gridTemplateColumns: "repeat(5,1fr)" }}>
+          {TABS.map(({ id, label, Icon }) => {
+            const on = tab === id;
+            return (
+              <button key={id} onClick={() => { setTab(id); if (id === "today") setViewKey(today); }}
+                style={{
+                  background: "none", border: "none", cursor: "pointer", padding: "11px 0 15px",
+                  color: on ? C.text : C.faint, display: "flex", flexDirection: "column",
+                  alignItems: "center", gap: 4,
+                }}>
+                <Icon size={19} strokeWidth={on ? 2.4 : 1.9} />
+                <span style={{ fontSize: 10.5, fontWeight: on ? 700 : 500 }}>{label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </nav>
+
+      <TaskSheet task={editTask} C={C} onSave={saveTask} onDelete={deleteTask} onClose={() => setEditTask(null)} />
+      <HabitSheet habit={editHabit} C={C} onSave={saveHabit} onDelete={deleteHabit} onClose={() => setEditHabit(null)} />
+      <GoalSheet goal={editGoal} C={C} onSave={saveGoal} onDelete={deleteGoal} onClose={() => setEditGoal(null)} />
+      <GoalLogSheet goal={logGoalFor} C={C} onClose={() => setLogGoalFor(null)}
+        onLog={(mins) => logGoal(todayKey(), logGoalFor, mins)} />
+      <Toasts toasts={toasts} C={C} />
+      {levelUp && <LevelUp level={levelUp} C={C} onClose={() => setLevelUp(null)} />}
+    </div>
+  );
+}
+
+const newTask = () => ({
+  id: uid(), name: "", start: "17:00", end: "17:30", anytime: false, minutes: 30,
+  category: "Revision", difficulty: "medium", must: false, optional: false, days: [0, 1, 2, 3, 4],
+});
+const newHabit = () => ({
+  id: uid(), name: "", category: "Recovery", difficulty: "easy", days: [0, 1, 2, 3, 4, 5, 6],
+});
+const newGoal = () => ({
+  id: uid(), name: "", category: "Training", difficulty: "medium", target: 3, minMinutes: 0,
+});
+
+/* --------------------------------- header -------------------------------- */
+
+function Header({ C, lvl, totalXp, streak, theme, onTheme }) {
+  return (
+    <header style={{ paddingTop: 18, paddingBottom: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+          <div style={{
+            width: 42, height: 42, borderRadius: 12, display: "grid", placeItems: "center",
+            background: `linear-gradient(150deg, ${ICE}, #3B7BD6)`, color: "#08121F",
+            fontFamily: "Archivo, Inter, sans-serif", fontWeight: 800, fontSize: 17,
+          }}>{lvl.level}</div>
+          <div>
+            <div className="apex-num" style={{ fontSize: 17, letterSpacing: "-.02em" }}>{rankFor(lvl.level)}</div>
+            <div style={{ fontSize: 11.5, color: C.dim }}>
+              {totalXp.toLocaleString()} XP · {lvl.level >= 100 ? "maxed" : `${(lvl.need - lvl.into).toLocaleString()} to level ${lvl.level + 1}`}
+            </div>
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div style={{
+            display: "flex", alignItems: "center", gap: 5, background: C.panel,
+            border: `1px solid ${streak > 0 ? EMBER : C.line}`, borderRadius: 99, padding: "6px 11px",
+          }}>
+            <Flame size={15} color={streak > 0 ? EMBER : C.faint} fill={streak > 0 ? EMBER : "none"} />
+            <span className="apex-num" style={{ fontSize: 15, color: streak > 0 ? C.text : C.faint }}>{streak}</span>
+          </div>
+          <button onClick={onTheme} aria-label="Switch theme" style={{
+            background: C.panel, border: `1px solid ${C.line}`, color: C.dim,
+            borderRadius: 99, padding: 8, cursor: "pointer", display: "grid", placeItems: "center",
+          }}>
+            {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
+        </div>
+      </div>
+      <Bar pct={lvl.pct} color={`linear-gradient(90deg, ${XP_C}, #FF8A3D)`} track={C.panel2} height={7} />
+    </header>
+  );
+}
+
+/* --------------------------------- today --------------------------------- */
+
+function TodayScreen({ C, state, ledger, viewKey, setViewKey, onToggle, onEdit, onAdd, onFreeze, onToggleHabit, onGoal }) {
+  const today = todayKey();
+  const isToday = viewKey === today;
+  const isFuture = parseKey(viewKey) > parseKey(today);
+  const tasks = tasksForDate(state.schedule, viewKey);
+  const habits = habitsForDate(state.habits, viewKey);
+  const day = state.log[viewKey] || { tasks: {}, habits: {} };
+  const core = tasks.filter((t) => !t.optional);
+  const doneCount = core.filter((t) => day.tasks && day.tasks[t.id]).length;
+  const extraDone = tasks.filter((t) => t.optional && day.tasks && day.tasks[t.id]).length;
+  const pct = core.length ? (doneCount / core.length) * 100 : 0;
+
+  const [now, setNow] = useState(() => new Date());
+  useEffect(() => { const i = setInterval(() => setNow(new Date()), 60000); return () => clearInterval(i); }, []);
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  const timed = tasks.filter((t) => !t.anytime);
+  const floating = tasks.filter((t) => t.anytime);
+  const first = timed.length ? toMin(timed[0].start) : 0;
+  const last = timed.length ? Math.max(...timed.map((t) => toMin(t.end))) : 1;
+  const span = Math.max(60, last - first);
+
+  const yesterday = shiftKey(today, -1);
+  const yDay = ledger.days.find((d) => d.key === yesterday);
+  const canFreeze = isToday && yDay && !yDay.qualified && !yDay.neutral && !yDay.frozen && ledger.stats.freezesAvailable > 0;
+
+  return (
+    <div>
+      {/* date rail */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+        <button onClick={() => setViewKey(shiftKey(viewKey, -1))} style={navBtn(C)} aria-label="Previous day">
+          <ChevronLeft size={17} />
+        </button>
+        <div style={{ textAlign: "center" }}>
+          <div className="apex-num" style={{ fontSize: 19, letterSpacing: "-.02em" }}>
+            {isToday ? "Today" : prettyDate(viewKey).split(",")[0]}
+          </div>
+          <div style={{ fontSize: 11.5, color: C.dim }}>{prettyDate(viewKey)}</div>
+        </div>
+        <button onClick={() => setViewKey(shiftKey(viewKey, 1))} style={navBtn(C)} aria-label="Next day">
+          <ChevronRight size={17} />
+        </button>
+      </div>
+
+      {/* the day track — the one bold element */}
+      <div style={{
+        background: C.panel, border: `1px solid ${C.line}`, borderRadius: 18,
+        padding: "16px 16px 14px", marginBottom: 14, boxShadow: C.shadow,
+      }}>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 12 }}>
+          <div>
+            {core.length === 0 ? (
+              <span className="apex-num" style={{ fontSize: 32, letterSpacing: "-.03em" }}>Rest day</span>
+            ) : (<>
+              <span className="apex-num" style={{ fontSize: 38, letterSpacing: "-.03em" }}>{Math.round(pct)}</span>
+              <span className="apex-num" style={{ fontSize: 19, color: C.dim }}>%</span>
+            </>)}
+            <span style={{ fontSize: 12.5, color: C.dim, marginLeft: 9 }}>
+              {core.length === 0 ? "nothing required" : `${doneCount} of ${core.length} done`}
+              {extraDone > 0 && <span style={{ color: ICE }}> · +{extraDone} extra</span>}
+            </span>
+          </div>
+          {timed.length > 0 ? (
+            <div style={{ fontSize: 11.5, color: C.faint }}>{timed[0].start}–{timed[timed.length - 1].end}</div>
+          ) : floating.length > 0 ? (
+            <div style={{ fontSize: 11.5, color: C.faint }}>
+              {Math.floor(floating.reduce((a, t) => a + durationOf(t), 0) / 60)}h to place
+            </div>
+          ) : null}
+        </div>
+
+        <div style={{ position: "relative", height: timed.length ? 26 : 0, display: timed.length ? "block" : "none" }}>
+          <div style={{ position: "absolute", top: 11, left: 0, right: 0, height: 3, background: C.panel2, borderRadius: 2 }} />
+          {timed.map((t) => {
+            const l = ((toMin(t.start) - first) / span) * 100;
+            const w = Math.max(2.5, ((toMin(t.end) - toMin(t.start)) / span) * 100);
+            const done = !!day.tasks[t.id];
+            return (
+              <div key={t.id} title={`${t.name} · ${t.start}`} style={{
+                position: "absolute", left: `${l}%`, width: `${w}%`, top: 5, height: 15,
+                background: done ? CATEGORIES[t.category] : "transparent",
+                border: `1.5px ${t.optional && !done ? "dashed" : "solid"} ${done ? CATEGORIES[t.category] : C.line}`,
+                borderRadius: 5, transition: "background .35s ease",
+                opacity: t.optional && !done ? .6 : 1,
+              }} />
+            );
+          })}
+          {isToday && timed.length > 0 && nowMin >= first && nowMin <= last && (
+            <div style={{
+              position: "absolute", left: `${((nowMin - first) / span) * 100}%`, top: 0,
+              width: 2, height: 26, background: C.text, borderRadius: 2, opacity: .75,
+            }} />
+          )}
+        </div>
+
+        {timed.length === 0 && floating.length > 0 && (
+          <div style={{ display: "flex", gap: 5 }}>
+            {floating.map((t) => {
+              const done = !!day.tasks[t.id];
+              return (
+                <div key={t.id} title={t.name} style={{
+                  flex: durationOf(t), height: 15, borderRadius: 5,
+                  background: done ? CATEGORIES[t.category] : "transparent",
+                  border: `1.5px ${t.optional && !done ? "dashed" : "solid"} ${done ? CATEGORIES[t.category] : C.line}`,
+                  transition: "background .35s ease",
+                }} />
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {canFreeze && (
+        <button onClick={() => onFreeze(yesterday)} style={{
+          width: "100%", background: C.panel, border: `1px solid ${ICE}`, borderRadius: 14,
+          padding: "12px 14px", color: C.text, cursor: "pointer", marginBottom: 14,
+          display: "flex", alignItems: "center", gap: 10, textAlign: "left",
+        }}>
+          <Snowflake size={17} color={ICE} />
+          <div>
+            <div style={{ fontSize: 13.5, fontWeight: 600 }}>Save yesterday's streak</div>
+            <div style={{ fontSize: 11.5, color: C.dim }}>
+              {ledger.stats.freezesAvailable} freeze{ledger.stats.freezesAvailable === 1 ? "" : "s"} banked
+            </div>
+          </div>
+        </button>
+      )}
+
+      {state.sampleData && (
+        <div style={{
+          background: C.panel2, border: `1px dashed ${C.line}`, borderRadius: 12,
+          padding: "11px 13px", marginBottom: 14, fontSize: 12.5, color: C.dim,
+        }}>
+          These three sessions are placeholders. Add your own and they'll disappear.
+        </div>
+      )}
+
+      {tasks.length === 0 ? (
+        <Empty C={C} title="Nothing scheduled" body={`No sessions set for ${DOW[dowOf(viewKey)]}. Add one and it repeats every week.`} onAdd={onAdd} />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {tasks.map((t) => (
+            <TaskRow key={t.id} t={t} C={C} done={!!day.tasks[t.id]} locked={isFuture}
+              onToggle={() => onToggle(viewKey, t)} onEdit={() => onEdit(t)} />
+          ))}
+        </div>
+      )}
+
+      {habits.length > 0 && (
+        <>
+          <SectionTitle C={C}>Habits</SectionTitle>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {habits.map((h) => {
+              const done = !!(day.habits && day.habits[h.id]);
+              return (
+                <button key={h.id} disabled={isFuture} onClick={() => onToggleHabit(viewKey, h)} style={{
+                  background: done ? CATEGORIES[h.category] : C.panel,
+                  color: done ? "#0F1420" : C.text,
+                  border: `1px solid ${done ? CATEGORIES[h.category] : C.line}`,
+                  borderRadius: 99, padding: "8px 14px", fontSize: 13, fontWeight: 600,
+                  cursor: isFuture ? "default" : "pointer", opacity: isFuture ? .5 : 1,
+                  display: "flex", alignItems: "center", gap: 7,
+                }}>
+                  {done && <Check size={14} strokeWidth={3} />}{h.name}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {isToday && (state.goals || []).length > 0 && (
+        <>
+          <SectionTitle C={C}>This week</SectionTitle>
+          <GoalStrip C={C} state={state} dayKey={viewKey} onGoal={onGoal} compact />
+        </>
+      )}
+
+      <button onClick={onAdd} style={{
+        marginTop: 18, width: "100%", background: "none", border: `1px dashed ${C.line}`,
+        borderRadius: 14, padding: "13px", color: C.dim, cursor: "pointer",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13.5,
+      }}>
+        <Plus size={16} /> Add a session
+      </button>
+    </div>
+  );
+}
+
+const navBtn = (C) => ({
+  background: C.panel, border: `1px solid ${C.line}`, color: C.dim,
+  borderRadius: 11, padding: 9, cursor: "pointer", display: "grid", placeItems: "center",
+});
+
+function GoalStrip({ C, state, dayKey, onGoal, compact }) {
+  const goals = state.goals || [];
+  if (!goals.length) return null;
+  const counts = weekGoalCounts(state, dayKey);
+  const today = todayKey();
+  const entry = state.log[today] || {};
+  const wsLabel = weekStartOf(dayKey);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {goals.map((g) => {
+        const n = counts[g.id] || 0;
+        const met = n >= g.target;
+        const loggedToday = !!(entry.goals && entry.goals[g.id]);
+        const col = CATEGORIES[g.category];
+        return (
+          <div key={g.id} style={{
+            background: C.panel, border: `1px solid ${met ? col + "66" : C.line}`,
+            borderRadius: 14, padding: "11px 13px", display: "flex", alignItems: "center", gap: 12,
+          }}>
+            <button onClick={() => onGoal(g)} aria-label={`Log ${g.name}`} style={{
+              width: 25, height: 25, borderRadius: 8, flexShrink: 0, display: "grid", placeItems: "center",
+              background: loggedToday ? col : "transparent",
+              border: `2px solid ${loggedToday ? col : C.line}`, color: "#0F1420", cursor: "pointer",
+            }}>{loggedToday && <Check size={15} strokeWidth={3.4} />}</button>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8 }}>
+                <span style={{ fontSize: 14, fontWeight: 600, color: met ? C.text : C.text }}>{g.name}</span>
+                <span className="apex-num" style={{ fontSize: 13, color: met ? col : C.dim }}>
+                  {n}/{g.target}
+                </span>
+              </div>
+              <div style={{ display: "flex", gap: 3, marginTop: 7 }}>
+                {Array.from({ length: g.target }, (_, i) => (
+                  <div key={i} style={{
+                    flex: 1, height: 5, borderRadius: 3,
+                    background: i < n ? col : C.panel2,
+                    border: i < n ? "none" : `1px solid ${C.line}`,
+                  }} />
+                ))}
+              </div>
+              {!compact && (
+                <div style={{ fontSize: 11, color: C.faint, marginTop: 5 }}>
+                  {g.minMinutes > 0 ? `${g.minMinutes} min minimum · ` : ""}
+                  {met ? "target met" : `${g.target - n} to go this week`}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SectionTitle({ children, C }) {
+  return <h3 className="apex-num" style={{ fontSize: 15, color: C.text, margin: "22px 0 10px", letterSpacing: "-.01em" }}>{children}</h3>;
+}
+
+function Empty({ C, title, body, onAdd }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: 26, textAlign: "center" }}>
+      <div className="apex-num" style={{ fontSize: 17, marginBottom: 6 }}>{title}</div>
+      <div style={{ fontSize: 13, color: C.dim, marginBottom: 16, lineHeight: 1.5 }}>{body}</div>
+      {onAdd && (
+        <button onClick={onAdd} style={{
+          background: XP_C, color: "#1A1206", border: "none", borderRadius: 11,
+          padding: "10px 18px", fontWeight: 700, fontSize: 13.5, cursor: "pointer",
+        }}>Add a session</button>
+      )}
+    </div>
+  );
+}
+
+function TaskRow({ t, C, done, locked, onToggle, onEdit }) {
+  const col = CATEGORIES[t.category];
+  return (
+    <div style={{
+      display: "flex", alignItems: "stretch", background: C.panel,
+      border: `1px solid ${done ? col + "66" : C.line}`, borderRadius: 14, overflow: "hidden",
+      opacity: locked ? .55 : 1, transition: "border-color .3s ease",
+    }}>
+      <div style={{ width: 4, background: col, flexShrink: 0 }} />
+      <button disabled={locked} onClick={onToggle} style={{
+        flex: 1, background: "none", border: "none", cursor: locked ? "default" : "pointer",
+        padding: "12px 8px 12px 13px", display: "flex", alignItems: "center", gap: 12, textAlign: "left",
+      }}>
+        <span className={done ? "apex-pop" : ""} style={{
+          width: 25, height: 25, borderRadius: 8, flexShrink: 0, display: "grid", placeItems: "center",
+          background: done ? col : "transparent", border: `2px solid ${done ? col : C.line}`,
+          color: "#0F1420",
+        }}>{done && <Check size={15} strokeWidth={3.4} />}</span>
+        <span style={{ flex: 1, minWidth: 0 }}>
+          <span style={{
+            display: "block", fontSize: 14.5, fontWeight: 600, color: C.text,
+            textDecoration: done ? "line-through" : "none", opacity: done ? .55 : 1,
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          }}>{t.name || "Untitled session"}</span>
+          <span style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 3, fontSize: 11.5, color: C.dim }}>
+            <Clock size={11} /> {t.anytime ? `${t.minutes} min, any time` : `${fmtTime(t.start)}–${fmtTime(t.end)}`}
+            <span style={{ color: col }}>{t.category}</span>
+            {t.must && <span style={{ color: EMBER }}>non-negotiable</span>}
+            {t.optional && <span style={{ color: ICE }}>optional</span>}
+          </span>
+        </span>
+        <span className="apex-num" style={{ fontSize: 13, color: done ? XP_C : C.faint, flexShrink: 0 }}>
+          +{DIFFICULTY[t.difficulty] + (t.optional ? EXTRA_BONUS : 0)}
+        </span>
+      </button>
+      <button onClick={onEdit} aria-label="Edit session" style={{
+        background: "none", border: "none", borderLeft: `1px solid ${C.line}`,
+        color: C.faint, padding: "0 12px", cursor: "pointer",
+      }}><Pencil size={14} /></button>
+    </div>
+  );
+}
+
+/* --------------------------------- habits -------------------------------- */
+
+function HabitsScreen({ C, state, ledger, onToggle, onEdit, onAdd, onEditGoal, onAddGoal, onGoal }) {
+  const today = todayKey();
+  const day = state.log[today] || { habits: {} };
+  const last14 = Array.from({ length: 14 }, (_, i) => shiftKey(today, i - 13));
+
+  return (
+    <div>
+      <SectionTitle C={C}>Habits</SectionTitle>
+      {state.habits.length === 0 ? (
+        <Empty C={C} title="No habits yet" body="Habits repeat on the days you choose and feed the same XP pool as your sessions." onAdd={onAdd} />
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {state.habits.map((h) => {
+            const scheduled = h.days.includes(dowOf(today));
+            const done = !!day.habits[h.id];
+            let run = 0;
+            for (let i = 0; i < 400; i++) {
+              const k = shiftKey(today, -i);
+              if (!h.days.includes(dowOf(k))) continue;
+              const e = state.log[k];
+              if (e && e.habits && e.habits[h.id]) run++;
+              else if (i === 0) continue;
+              else break;
+            }
+            return (
+              <div key={h.id} style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 14, padding: 13 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+                  <button disabled={!scheduled} onClick={() => onToggle(today, h)} style={{
+                    width: 27, height: 27, borderRadius: 9, flexShrink: 0, display: "grid", placeItems: "center",
+                    background: done ? CATEGORIES[h.category] : "transparent",
+                    border: `2px solid ${done ? CATEGORIES[h.category] : C.line}`,
+                    color: "#0F1420", cursor: scheduled ? "pointer" : "default", opacity: scheduled ? 1 : .4,
+                  }}>{done && <Check size={16} strokeWidth={3.4} />}</button>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 14.5, fontWeight: 600 }}>{h.name || "Untitled habit"}</div>
+                    <div style={{ fontSize: 11.5, color: C.dim, display: "flex", gap: 8, marginTop: 2 }}>
+                      <span style={{ color: CATEGORIES[h.category] }}>{h.category}</span>
+                      <span>+{DIFFICULTY[h.difficulty]} XP</span>
+                      {run > 0 && <span style={{ color: EMBER }}>{run}-day run</span>}
+                    </div>
+                  </div>
+                  <button onClick={() => onEdit(h)} aria-label="Edit habit" style={{ background: "none", border: "none", color: C.faint, cursor: "pointer", padding: 6 }}>
+                    <Pencil size={14} />
+                  </button>
+                </div>
+                <div style={{ display: "flex", gap: 3, marginTop: 11 }}>
+                  {last14.map((k) => {
+                    const sched = h.days.includes(dowOf(k));
+                    const e = state.log[k];
+                    const hit = e && e.habits && e.habits[h.id];
+                    return (
+                      <div key={k} title={k} style={{
+                        flex: 1, height: 6, borderRadius: 3,
+                        background: hit ? CATEGORIES[h.category] : sched ? C.panel2 : "transparent",
+                        border: sched && !hit ? `1px solid ${C.line}` : "none",
+                      }} />
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <button onClick={onAdd} style={{
+        marginTop: 14, width: "100%", background: "none", border: `1px dashed ${C.line}`,
+        borderRadius: 14, padding: 13, color: C.dim, cursor: "pointer",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13.5,
+      }}><Plus size={16} /> Add a habit</button>
+
+      <SectionTitle C={C}>Weekly goals</SectionTitle>
+      {(state.goals || []).length === 0 ? (
+        <Empty C={C} title="No weekly goals" body="Goals are counted per week rather than tied to a day — three cardio sessions, sheets washed once, that shape." />
+      ) : (
+        <>
+          <GoalStrip C={C} state={state} dayKey={todayKey()} onGoal={onGoal} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10 }}>
+            {(state.goals || []).map((g) => (
+              <button key={g.id} onClick={() => onEditGoal(g)} style={{
+                background: "none", border: "none", color: C.faint, cursor: "pointer",
+                fontSize: 12, textAlign: "left", padding: "2px 0", display: "flex",
+                alignItems: "center", gap: 7,
+              }}>
+                <Pencil size={12} /> Edit {g.name}
+              </button>
+            ))}
+          </div>
+          <GoalHistory C={C} state={state} />
+        </>
+      )}
+      <button onClick={onAddGoal} style={{
+        marginTop: 12, width: "100%", background: "none", border: `1px dashed ${C.line}`,
+        borderRadius: 14, padding: 13, color: C.dim, cursor: "pointer",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 13.5,
+      }}><Plus size={16} /> Add a weekly goal</button>
+
+      <SectionTitle C={C}>Weekly schedule</SectionTitle>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 14, padding: 13 }}>
+        {DOW.map((d, i) => {
+          const n = state.schedule.filter((t) => t.days.includes(i)).length;
+          const mins = state.schedule.filter((t) => t.days.includes(i))
+            .reduce((s, t) => s + durationOf(t), 0);
+          return (
+            <div key={d} style={{
+              display: "flex", alignItems: "center", gap: 11, padding: "7px 0",
+              borderBottom: i < 6 ? `1px solid ${C.line}` : "none",
+            }}>
+              <span className="apex-num" style={{ width: 38, fontSize: 13, color: C.dim }}>{d}</span>
+              <div style={{ flex: 1 }}>
+                <Bar pct={Math.min(100, (mins / 300) * 100)} color={n ? CATEGORIES.Revision : C.line} track={C.panel2} height={6} />
+              </div>
+              <span style={{ fontSize: 11.5, color: C.faint, width: 74, textAlign: "right" }}>
+                {n} · {Math.floor(mins / 60)}h {mins % 60}m
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function GoalHistory({ C, state }) {
+  const goals = state.goals || [];
+  const weeks = Array.from({ length: 6 }, (_, i) => shiftKey(weekStartOf(todayKey()), (i - 5) * 7));
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 14, padding: 13, marginTop: 12 }}>
+      <div style={{ fontSize: 12, color: C.dim, marginBottom: 10 }}>Last six weeks</div>
+      {goals.map((g) => (
+        <div key={g.id} style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 8 }}>
+          <span style={{ fontSize: 12, color: C.dim, width: 96, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {g.name}
+          </span>
+          <div style={{ display: "flex", gap: 4, flex: 1 }}>
+            {weeks.map((w) => {
+              const c = weekGoalCounts(state, w)[g.id] || 0;
+              const met = c >= g.target;
+              return (
+                <div key={w} title={`${w}: ${c}/${g.target}`} style={{
+                  flex: 1, height: 20, borderRadius: 5,
+                  background: met ? CATEGORIES[g.category] : c > 0 ? CATEGORIES[g.category] + "44" : C.panel2,
+                  border: `1px solid ${met ? CATEGORIES[g.category] : C.line}`,
+                  display: "grid", placeItems: "center", fontSize: 10, fontWeight: 700,
+                  color: met ? "#0F1420" : C.faint, fontFamily: "Archivo, Inter, sans-serif",
+                }}>{c || ""}</div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------------------------- stats -------------------------------- */
+
+function StatsScreen({ C, state, ledger, lvl }) {
+  const s = ledger.stats;
+  const today = todayKey();
+  const last14 = Array.from({ length: 14 }, (_, i) => shiftKey(today, i - 13));
+  const xpByDay = last14.map((k) => {
+    const d = ledger.days.find((x) => x.key === k);
+    return { k, xp: d ? d.total : 0 };
+  });
+  const maxXp = Math.max(50, ...xpByDay.map((d) => d.xp));
+
+  const weeks = 13;
+  const heat = [];
+  const anchor = shiftKey(today, -dowOf(today)); // Monday of this week
+  for (let w = weeks - 1; w >= 0; w--) {
+    const col = [];
+    for (let d = 0; d < 7; d++) col.push(shiftKey(anchor, -w * 7 + d));
+    heat.push(col);
+  }
+  const rateOf = (k) => {
+    const d = ledger.days.find((x) => x.key === k);
+    if (!d) return null;
+    if (parseKey(k) > parseKey(today)) return null;
+    return d.rate;
+  };
+
+  const totalPlanned = ledger.days.reduce((a, d) => a + d.planned, 0);
+  const totalDone = ledger.days.reduce((a, d) => a + d.doneCount, 0);
+  const success = totalPlanned ? Math.round((totalDone / totalPlanned) * 100) : 0;
+
+  const catTotals = CAT_KEYS.map((c) => ({ c, n: s[`cat:${c}`] || 0 })).filter((x) => x.n > 0)
+    .sort((a, b) => b.n - a.n);
+  const catMax = Math.max(1, ...catTotals.map((x) => x.n));
+
+  return (
+    <div>
+      <SectionTitle C={C}>Your numbers</SectionTitle>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 9 }}>
+        <Stat C={C} label="Total XP" value={ledger.totalXp.toLocaleString()} color={XP_C}
+          sub={`${ledger.achXp.toLocaleString()} from awards`} />
+        <Stat C={C} label="Current streak" value={s.streak} color={EMBER} sub={`best ${s.bestStreak}`} />
+        <Stat C={C} label="Sessions done" value={s.tasksDone.toLocaleString()} sub={`${s.habitsDone} habits ticked`} />
+        <Stat C={C} label="Success rate" value={`${success}%`} color={success >= 80 ? MINT : undefined}
+          sub={`${totalDone} of ${totalPlanned} planned`} />
+        <Stat C={C} label="Hours banked" value={`${Math.floor(s.minutes / 60)}h`} sub={`${s.minutes % 60}m over ${s.daysActive} days`} />
+        <Stat C={C} label="Perfect days" value={s.perfectDays} color={ICE} sub={`${s.perfectWeeks} perfect weeks`} />
+      </div>
+
+      <SectionTitle C={C}>XP, last 14 days</SectionTitle>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: "16px 14px 10px" }}>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 5, height: 116 }}>
+          {xpByDay.map((d) => (
+            <div key={d.k} style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "flex-end", alignItems: "center", gap: 6, height: "100%" }}>
+              <div title={`${d.k}: ${d.xp} XP`} style={{
+                width: "100%", height: `${(d.xp / maxXp) * 100}%`, minHeight: d.xp > 0 ? 4 : 2,
+                background: d.xp > 0 ? `linear-gradient(180deg, ${XP_C}, #FF8A3D)` : C.panel2,
+                borderRadius: "4px 4px 2px 2px", transition: "height .5s ease",
+              }} />
+              <span style={{ fontSize: 9, color: C.faint }}>{DOW[dowOf(d.k)][0]}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <SectionTitle C={C}>Consistency</SectionTitle>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: 15, overflowX: "auto" }}>
+        <div style={{ display: "flex", gap: 3, minWidth: 300 }}>
+          {heat.map((col, i) => (
+            <div key={i} style={{ display: "flex", flexDirection: "column", gap: 3, flex: 1 }}>
+              {col.map((k) => {
+                const r = rateOf(k);
+                const bg = r === null ? C.panel2
+                  : r >= 1 ? MINT : r >= .6 ? XP_C : r > 0 ? "#8B6A2E" : C.panel2;
+                return <div key={k} title={`${k}${r === null ? "" : ` · ${Math.round(r * 100)}%`}`}
+                  style={{ paddingTop: "100%", borderRadius: 3, background: bg, opacity: r === null ? .55 : 1 }} />;
+              })}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 12, fontSize: 11, color: C.faint }}>
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <i style={{ width: 9, height: 9, borderRadius: 2, background: MINT, display: "inline-block" }} /> everything
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <i style={{ width: 9, height: 9, borderRadius: 2, background: XP_C, display: "inline-block" }} /> most of it
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 5 }}>
+            <i style={{ width: 9, height: 9, borderRadius: 2, background: C.panel2, display: "inline-block" }} /> nothing logged
+          </span>
+        </div>
+      </div>
+
+      {catTotals.length > 0 && (
+        <>
+          <SectionTitle C={C}>Where the time goes</SectionTitle>
+          <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: 15 }}>
+            {catTotals.map((x, i) => (
+              <div key={x.c} style={{ marginBottom: i < catTotals.length - 1 ? 12 : 0 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, marginBottom: 5 }}>
+                  <span style={{ color: C.text }}>{x.c}</span>
+                  <span className="apex-num" style={{ color: C.dim }}>{x.n}</span>
+                </div>
+                <Bar pct={(x.n / catMax) * 100} color={CATEGORIES[x.c]} track={C.panel2} height={7} />
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      <SectionTitle C={C}>Level {lvl.level}</SectionTitle>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, color: C.dim, marginBottom: 8 }}>
+          <span>{rankFor(lvl.level)}</span>
+          <span className="apex-num">{lvl.into.toLocaleString()} / {lvl.need.toLocaleString()}</span>
+        </div>
+        <Bar pct={lvl.pct} color={`linear-gradient(90deg, ${ICE}, #3B7BD6)`} track={C.panel2} height={9} />
+        <div style={{ fontSize: 12, color: C.faint, marginTop: 10, lineHeight: 1.5 }}>
+          Next rank at level {(RANKS.find(([m]) => m > lvl.level) || [100, "Apex"])[0]} — {(RANKS.find(([m]) => m > lvl.level) || [100, "Apex"])[1]}.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------- awards -------------------------------- */
+
+function AwardsScreen({ C, ledger }) {
+  const [filter, setFilter] = useState("All");
+  const unlocked = new Set(ledger.unlockedIds);
+  const groups = ["All", ...Object.keys(ACH_BY_GROUP)];
+  const list = filter === "All" ? ACHIEVEMENTS : ACH_BY_GROUP[filter];
+  const shown = [...list].sort((a, b) => {
+    const ua = unlocked.has(a.id), ub = unlocked.has(b.id);
+    if (ua !== ub) return ua ? -1 : 1;
+    return a.target - b.target;
+  });
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 10, margin: "20px 0 12px" }}>
+        <span className="apex-num" style={{ fontSize: 30, letterSpacing: "-.03em" }}>{unlocked.size}</span>
+        <span style={{ fontSize: 13, color: C.dim }}>of {ACHIEVEMENTS.length} unlocked</span>
+      </div>
+      <Bar pct={(unlocked.size / ACHIEVEMENTS.length) * 100} color={`linear-gradient(90deg, ${XP_C}, ${EMBER})`} track={C.panel2} height={7} />
+
+      <div style={{ display: "flex", gap: 7, overflowX: "auto", padding: "14px 0", marginBottom: 4 }}>
+        {groups.map((g) => (
+          <Chip key={g} active={filter === g} onClick={() => setFilter(g)} C={C} small>{g}</Chip>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gap: 8 }}>
+        {shown.map((a) => {
+          const on = unlocked.has(a.id);
+          const col = RARITY_C[a.rarity];
+          const progress = Math.min(100, ((ledger.stats[a.metric] || 0) / a.target) * 100);
+          return (
+            <div key={a.id} style={{
+              background: C.panel, border: `1px solid ${on ? col + "55" : C.line}`,
+              borderRadius: 14, padding: 13, display: "flex", gap: 12, alignItems: "center",
+            }}>
+              <div style={{
+                width: 38, height: 38, borderRadius: 11, flexShrink: 0, display: "grid", placeItems: "center",
+                background: on ? col : C.panel2, color: on ? "#0F1420" : C.faint,
+                border: on ? "none" : `1px solid ${C.line}`,
+              }}>
+                {on ? <Trophy size={18} /> : <Lock size={15} />}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 14, fontWeight: 650, color: on ? C.text : C.dim }}>{a.name}</span>
+                  <span style={{ fontSize: 10, color: col, border: `1px solid ${col}44`, borderRadius: 99, padding: "1px 7px" }}>
+                    {a.rarity}
+                  </span>
+                </div>
+                <div style={{ fontSize: 11.5, color: C.faint, marginTop: 2 }}>{a.desc}</div>
+                {!on && progress > 0 && (
+                  <div style={{ marginTop: 7 }}>
+                    <Bar pct={progress} color={col} track={C.panel2} height={4} />
+                  </div>
+                )}
+              </div>
+              <span className="apex-num" style={{ fontSize: 12.5, color: on ? XP_C : C.faint, flexShrink: 0 }}>+{a.xp}</span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------- review -------------------------------- */
+
+function ReviewScreen({ C, state, ledger, setState }) {
+  const today = todayKey();
+  const day = ledger.days.find((d) => d.key === today);
+  const tasks = tasksForDate(state.schedule, today);
+  const entry = state.log[today] || { tasks: {}, habits: {}, note: "" };
+  const missed = tasks.filter((t) => !entry.tasks[t.id]);
+  const pct = day && day.planned ? Math.round((day.doneCount / day.planned) * 100) : 0;
+
+  const verdict =
+    pct === 100 ? "Perfect. Nothing left on the board."
+      : pct >= 80 ? "Strong day. That's the standard."
+        : pct >= 50 ? "Half held. The gap is where tomorrow's plan goes."
+          : pct > 0 ? "Started, not finished. One session is still one session."
+            : "Blank day. Tick one thing and the streak restarts tonight.";
+
+  const suggestions = [];
+  if (missed.length) {
+    const late = missed.filter((t) => !t.anytime && toMin(t.start) >= 1200);
+    if (late.length >= 2) suggestions.push("Two or more misses came after 20:00 — try moving one session earlier.");
+    const cats = [...new Set(missed.map((t) => t.category))];
+    if (cats.length === 1) suggestions.push(`Every miss today was ${cats[0]}. Worth checking whether those slots are realistic.`);
+  }
+  if (ledger.stats.streak >= 7) suggestions.push(`Your streak multiplier is ${streakMult(ledger.stats.streak).toFixed(2)}× — every session is worth more right now.`);
+  if (!suggestions.length && pct === 100) suggestions.push("Consider adding one harder session — you're clearing the plan comfortably.");
+  if (!suggestions.length) suggestions.push("Pick tomorrow's first session tonight so you don't decide in the morning.");
+
+  return (
+    <div>
+      <SectionTitle C={C}>Today's review</SectionTitle>
+      <div style={{
+        background: C.panel, border: `1px solid ${C.line}`, borderRadius: 18, padding: 18, boxShadow: C.shadow,
+      }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <span className="apex-num" style={{ fontSize: 46, letterSpacing: "-.035em" }}>{pct}</span>
+          <span className="apex-num" style={{ fontSize: 22, color: C.dim }}>%</span>
+        </div>
+        <div style={{ fontSize: 14, color: C.text, marginTop: 4 }}>{verdict}</div>
+        <div style={{ fontSize: 12.5, color: C.dim, marginTop: 3 }}>
+          {ledger.stats.streak}-day streak {day && day.neutral ? "paused — rest day" : day && day.qualified ? "held" : "at risk"}.
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 9, marginTop: 16 }}>
+          <MiniStat C={C} label="Done" value={day ? day.doneCount : 0} />
+          <MiniStat C={C} label="Missed" value={missed.length} color={missed.length ? EMBER : undefined} />
+          <MiniStat C={C} label="XP" value={day ? day.total : 0} color={XP_C} />
+        </div>
+
+        {day && day.total > 0 && (
+          <div style={{ marginTop: 14, fontSize: 12, color: C.dim, lineHeight: 1.7 }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>Sessions and habits</span><span className="apex-num">{day.rawTaskXp + day.rawHabitXp}</span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span>Streak multiplier</span><span className="apex-num">{day.mult.toFixed(2)}×</span>
+            </div>
+            {day.bonuses.map((b) => (
+              <div key={b.label} style={{ display: "flex", justifyContent: "space-between", color: XP_C }}>
+                <span>{b.label}</span><span className="apex-num">+{b.xp}</span>
+              </div>
+            ))}
+            <div style={{ display: "flex", justifyContent: "space-between", color: C.text, borderTop: `1px solid ${C.line}`, marginTop: 6, paddingTop: 6 }}>
+              <span>Total</span><span className="apex-num">{day.total}</span>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {missed.length > 0 && (
+        <>
+          <SectionTitle C={C}>Left on the board</SectionTitle>
+          <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+            {missed.map((t) => (
+              <div key={t.id} style={{
+                background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12,
+                padding: "10px 13px", display: "flex", justifyContent: "space-between", fontSize: 13,
+              }}>
+                <span style={{ color: C.dim }}>{t.name}</span>
+                <span style={{ color: C.faint, fontSize: 11.5 }}>{t.anytime ? `${t.minutes} min` : t.start}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      <SectionTitle C={C}>What to change</SectionTitle>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 14, padding: 15 }}>
+        {suggestions.map((s, i) => (
+          <div key={i} style={{ display: "flex", gap: 9, marginBottom: i < suggestions.length - 1 ? 10 : 0 }}>
+            <Sparkles size={15} color={XP_C} style={{ flexShrink: 0, marginTop: 2 }} />
+            <span style={{ fontSize: 13, color: C.dim, lineHeight: 1.5 }}>{s}</span>
+          </div>
+        ))}
+      </div>
+
+      <SectionTitle C={C}>Note for tomorrow</SectionTitle>
+      <textarea
+        value={entry.note || ""}
+        onChange={(e) => {
+          const v = e.target.value;
+          setState((s) => {
+            const cur = s.log[today] || { planned: coreCount(s.schedule, today), tasks: {}, habits: {} };
+            return { ...s, log: { ...s.log, [today]: { ...cur, note: v } } };
+          });
+        }}
+        placeholder="One line on what got in the way."
+        rows={3}
+        style={{
+          width: "100%", background: C.panel, border: `1px solid ${C.line}`, borderRadius: 12,
+          padding: 12, color: C.text, fontSize: 13.5, fontFamily: "inherit", resize: "vertical",
+        }}
+      />
+    </div>
+  );
+}
+
+function MiniStat({ C, label, value, color }) {
+  return (
+    <div style={{ background: C.panel2, borderRadius: 11, padding: "10px 11px" }}>
+      <div className="apex-num" style={{ fontSize: 20, color: color || C.text }}>{value}</div>
+      <div style={{ fontSize: 11, color: C.dim, marginTop: 2 }}>{label}</div>
+    </div>
+  );
+}
+
+/* --------------------------------- sheets -------------------------------- */
+
+function DayPicker({ days, onChange, C }) {
+  return (
+    <div style={{ display: "flex", gap: 6 }}>
+      {DOW.map((d, i) => {
+        const on = days.includes(i);
+        return (
+          <button key={d} onClick={() => onChange(on ? days.filter((x) => x !== i) : [...days, i].sort())}
+            style={{
+              flex: 1, background: on ? C.text : C.panel2, color: on ? C.bg : C.dim,
+              border: `1px solid ${on ? C.text : C.line}`, borderRadius: 9, padding: "8px 0",
+              fontSize: 11.5, fontWeight: 600, cursor: "pointer",
+            }}>{d[0]}</button>
+        );
+      })}
+    </div>
+  );
+}
+
+function Toggle({ C, on, color, onClick, label, last }) {
+  return (
+    <button onClick={onClick} style={{
+      display: "flex", alignItems: "center", gap: 9, background: "none", border: "none",
+      color: C.dim, cursor: "pointer", padding: 0, marginBottom: last ? 18 : 11,
+      fontSize: 13, textAlign: "left",
+    }}>
+      <span style={{
+        width: 20, height: 20, borderRadius: 6, flexShrink: 0, display: "grid", placeItems: "center",
+        background: on ? color : "transparent", border: `2px solid ${on ? color : C.line}`, color: "#0F1420",
+      }}>{on && <Check size={12} strokeWidth={3.4} />}</span>
+      {label}
+    </button>
+  );
+}
+
+const inputStyle = (C) => ({
+  width: "100%", background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 10,
+  padding: "11px 12px", color: C.text, fontSize: 14, fontFamily: "inherit",
+});
+
+function TaskSheet({ task, C, onSave, onDelete, onClose }) {
+  const [d, setD] = useState(task);
+  useEffect(() => setD(task), [task]);
+  if (!d) return null;
+  const set = (k, v) => setD((x) => ({ ...x, [k]: v }));
+  const valid = d.name.trim() && d.days.length &&
+    (d.anytime ? d.minutes > 0 : toMin(d.end) > toMin(d.start));
+
+  return (
+    <Sheet open={!!task} onClose={onClose} title={task && task.name ? "Edit session" : "New session"} C={C}>
+      <Field label="What is it" C={C}>
+        <input value={d.name} onChange={(e) => set("name", e.target.value)}
+          placeholder="Maths — quadratics" style={inputStyle(C)} />
+      </Field>
+      <Toggle C={C} on={d.anytime} color={CATEGORIES.Focus} onClick={() => set("anytime", !d.anytime)}
+        label="No fixed slot — fit it in anywhere that day" />
+      {d.anytime ? (
+        <Field label="How long" C={C}>
+          <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+            {[25, 50, 60, 75].map((m) => (
+              <Chip key={m} active={d.minutes === m} color={XP_C} onClick={() => set("minutes", m)} C={C} small>
+                {m} min
+              </Chip>
+            ))}
+          </div>
+          <input type="number" min="1" value={d.minutes}
+            onChange={(e) => set("minutes", Math.max(0, parseInt(e.target.value || "0", 10)))}
+            style={inputStyle(C)} />
+        </Field>
+      ) : (
+        <div style={{ display: "flex", gap: 11 }}>
+          <Field label="Start" C={C}>
+            <input type="time" value={d.start} onChange={(e) => set("start", e.target.value)} style={inputStyle(C)} />
+          </Field>
+          <Field label="End" C={C}>
+            <input type="time" value={d.end} onChange={(e) => set("end", e.target.value)} style={inputStyle(C)} />
+          </Field>
+        </div>
+      )}
+      <Field label="Category" C={C}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {CAT_KEYS.map((c) => (
+            <Chip key={c} active={d.category === c} color={CATEGORIES[c]} onClick={() => set("category", c)} C={C} small>{c}</Chip>
+          ))}
+        </div>
+      </Field>
+      <Field label="Effort" C={C}>
+        <div style={{ display: "flex", gap: 6 }}>
+          {DIFF_KEYS.map((k) => (
+            <Chip key={k} active={d.difficulty === k} color={XP_C} onClick={() => set("difficulty", k)} C={C} small>
+              {k} · {DIFFICULTY[k]} XP
+            </Chip>
+          ))}
+        </div>
+      </Field>
+      <Field label="Repeats on" C={C}>
+        <DayPicker days={d.days} onChange={(v) => set("days", v)} C={C} />
+      </Field>
+      <Toggle C={C} on={d.must} color={EMBER} onClick={() => set("must", !d.must)}
+        label="Non-negotiable — this one happens even on a bad day" />
+      <Toggle C={C} on={d.optional} color={ICE} onClick={() => set("optional", !d.optional)}
+        label={`Optional — never counts as a miss, and pays +${EXTRA_BONUS} bonus when cleared`} last />
+
+      <div style={{ display: "flex", gap: 9 }}>
+        {task && task.name && (
+          <button onClick={() => onDelete(d.id)} style={{
+            background: C.panel2, border: `1px solid ${C.line}`, color: EMBER,
+            borderRadius: 11, padding: "12px 15px", cursor: "pointer",
+          }}><Trash2 size={16} /></button>
+        )}
+        <button disabled={!valid} onClick={() => onSave({ ...d, name: d.name.trim() })} style={{
+          flex: 1, background: valid ? XP_C : C.panel2, color: valid ? "#1A1206" : C.faint,
+          border: "none", borderRadius: 11, padding: 13, fontWeight: 700, fontSize: 14,
+          cursor: valid ? "pointer" : "default",
+        }}>Save session</button>
+      </div>
+    </Sheet>
+  );
+}
+
+function HabitSheet({ habit, C, onSave, onDelete, onClose }) {
+  const [d, setD] = useState(habit);
+  useEffect(() => setD(habit), [habit]);
+  if (!d) return null;
+  const set = (k, v) => setD((x) => ({ ...x, [k]: v }));
+  const valid = d.name.trim() && d.days.length;
+
+  return (
+    <Sheet open={!!habit} onClose={onClose} title={habit && habit.name ? "Edit habit" : "New habit"} C={C}>
+      <Field label="What is it" C={C}>
+        <input value={d.name} onChange={(e) => set("name", e.target.value)} placeholder="In bed by 22:30" style={inputStyle(C)} />
+      </Field>
+      <Field label="Category" C={C}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {CAT_KEYS.map((c) => (
+            <Chip key={c} active={d.category === c} color={CATEGORIES[c]} onClick={() => set("category", c)} C={C} small>{c}</Chip>
+          ))}
+        </div>
+      </Field>
+      <Field label="Effort" C={C}>
+        <div style={{ display: "flex", gap: 6 }}>
+          {DIFF_KEYS.map((k) => (
+            <Chip key={k} active={d.difficulty === k} color={XP_C} onClick={() => set("difficulty", k)} C={C} small>
+              {k} · {DIFFICULTY[k]} XP
+            </Chip>
+          ))}
+        </div>
+      </Field>
+      <Field label="Days" C={C}>
+        <DayPicker days={d.days} onChange={(v) => set("days", v)} C={C} />
+      </Field>
+      <div style={{ display: "flex", gap: 9 }}>
+        {habit && habit.name && (
+          <button onClick={() => onDelete(d.id)} style={{
+            background: C.panel2, border: `1px solid ${C.line}`, color: EMBER,
+            borderRadius: 11, padding: "12px 15px", cursor: "pointer",
+          }}><Trash2 size={16} /></button>
+        )}
+        <button disabled={!valid} onClick={() => onSave({ ...d, name: d.name.trim() })} style={{
+          flex: 1, background: valid ? XP_C : C.panel2, color: valid ? "#1A1206" : C.faint,
+          border: "none", borderRadius: 11, padding: 13, fontWeight: 700, fontSize: 14,
+          cursor: valid ? "pointer" : "default",
+        }}>Save habit</button>
+      </div>
+    </Sheet>
+  );
+}
+
+function GoalLogSheet({ goal, C, onClose, onLog }) {
+  const [mins, setMins] = useState(45);
+  useEffect(() => { if (goal) setMins(goal.minMinutes || 30); }, [goal]);
+  if (!goal) return null;
+  const min = goal.minMinutes || 0;
+  const short = mins < min;
+  const picks = [min, min + 15, min + 30, min + 45].filter((x) => x > 0);
+
+  return (
+    <Sheet open={!!goal} onClose={onClose} title={`Log ${goal.name}`} C={C}>
+      <div style={{ fontSize: 13, color: C.dim, marginBottom: 14, lineHeight: 1.5 }}>
+        Anything under {min} minutes still earns XP, but it won't count toward your weekly target.
+      </div>
+      <Field label="How long" C={C}>
+        <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+          {picks.map((x) => (
+            <Chip key={x} active={mins === x} color={CATEGORIES[goal.category]} onClick={() => setMins(x)} C={C} small>
+              {x} min
+            </Chip>
+          ))}
+        </div>
+        <input type="number" min="1" value={mins}
+          onChange={(e) => setMins(Math.max(0, parseInt(e.target.value || "0", 10)))}
+          style={inputStyle(C)} />
+      </Field>
+      {short && (
+        <div style={{ fontSize: 12.5, color: EMBER, marginBottom: 14 }}>
+          {min - mins} minutes short of the target minimum.
+        </div>
+      )}
+      <button onClick={() => onLog(mins)} style={{
+        width: "100%", background: XP_C, color: "#1A1206", border: "none", borderRadius: 11,
+        padding: 13, fontWeight: 700, fontSize: 14, cursor: "pointer",
+      }}>Log {mins} minutes</button>
+    </Sheet>
+  );
+}
+
+function GoalSheet({ goal, C, onSave, onDelete, onClose }) {
+  const [d, setD] = useState(goal);
+  useEffect(() => setD(goal), [goal]);
+  if (!d) return null;
+  const set = (k, v) => setD((x) => ({ ...x, [k]: v }));
+  const valid = d.name.trim() && d.target >= 1;
+
+  return (
+    <Sheet open={!!goal} onClose={onClose} title={goal && goal.name ? "Edit goal" : "New weekly goal"} C={C}>
+      <Field label="What is it" C={C}>
+        <input value={d.name} onChange={(e) => set("name", e.target.value)} placeholder="Cardio" style={inputStyle(C)} />
+      </Field>
+      <Field label="Times per week" C={C}>
+        <div style={{ display: "flex", alignItems: "center", gap: 11 }}>
+          <button onClick={() => set("target", Math.max(1, d.target - 1))} style={navBtn(C)} aria-label="Fewer">
+            <ChevronLeft size={16} />
+          </button>
+          <span className="apex-num" style={{ fontSize: 26, minWidth: 34, textAlign: "center" }}>{d.target}</span>
+          <button onClick={() => set("target", Math.min(14, d.target + 1))} style={navBtn(C)} aria-label="More">
+            <ChevronRight size={16} />
+          </button>
+        </div>
+      </Field>
+      <Field label="Minimum minutes per session (0 for none)" C={C}>
+        <input type="number" min="0" value={d.minMinutes}
+          onChange={(e) => set("minMinutes", Math.max(0, parseInt(e.target.value || "0", 10)))}
+          style={inputStyle(C)} />
+      </Field>
+      <Field label="Category" C={C}>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {CAT_KEYS.map((c) => (
+            <Chip key={c} active={d.category === c} color={CATEGORIES[c]} onClick={() => set("category", c)} C={C} small>{c}</Chip>
+          ))}
+        </div>
+      </Field>
+      <Field label="Effort" C={C}>
+        <div style={{ display: "flex", gap: 6 }}>
+          {DIFF_KEYS.map((k) => (
+            <Chip key={k} active={d.difficulty === k} color={XP_C} onClick={() => set("difficulty", k)} C={C} small>
+              {k} · {DIFFICULTY[k]} XP
+            </Chip>
+          ))}
+        </div>
+      </Field>
+      <div style={{ fontSize: 12, color: C.faint, marginBottom: 16, lineHeight: 1.5 }}>
+        Hitting the target pays a {GOAL_BONUS} XP bonus. Meeting every goal in one week pays {ALL_GOALS_BONUS}.
+      </div>
+      <div style={{ display: "flex", gap: 9 }}>
+        {goal && goal.name && (
+          <button onClick={() => onDelete(d.id)} style={{
+            background: C.panel2, border: `1px solid ${C.line}`, color: EMBER,
+            borderRadius: 11, padding: "12px 15px", cursor: "pointer",
+          }}><Trash2 size={16} /></button>
+        )}
+        <button disabled={!valid} onClick={() => onSave({ ...d, name: d.name.trim() })} style={{
+          flex: 1, background: valid ? XP_C : C.panel2, color: valid ? "#1A1206" : C.faint,
+          border: "none", borderRadius: 11, padding: 13, fontWeight: 700, fontSize: 14,
+          cursor: valid ? "pointer" : "default",
+        }}>Save goal</button>
+      </div>
+    </Sheet>
+  );
+}
+
+/* ------------------------------ celebrations ----------------------------- */
+
+function Toasts({ toasts, C }) {
+  if (!toasts.length) return null;
+  return (
+    <div style={{
+      position: "fixed", left: 0, right: 0, bottom: 84, zIndex: 70,
+      display: "flex", flexDirection: "column", alignItems: "center", gap: 8, pointerEvents: "none",
+    }}>
+      {toasts.slice(0, 3).map((t) => {
+        const col = RARITY_C[t.ach.rarity];
+        return (
+          <div key={t.key} className="apex-toast" style={{
+            background: C.panel, border: `1px solid ${col}`, borderRadius: 14,
+            padding: "11px 15px", display: "flex", alignItems: "center", gap: 11,
+            boxShadow: C.shadow, maxWidth: 400, width: "90%",
+          }}>
+            <div style={{ width: 32, height: 32, borderRadius: 10, background: col, display: "grid", placeItems: "center", color: "#0F1420", flexShrink: 0 }}>
+              <Trophy size={16} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 13.5, fontWeight: 650, color: C.text }}>{t.ach.name}</div>
+              <div style={{ fontSize: 11.5, color: C.dim }}>{t.ach.desc}</div>
+            </div>
+            <span className="apex-num" style={{ color: XP_C, fontSize: 13 }}>+{t.ach.xp}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LevelUp({ level, C, onClose }) {
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, zIndex: 90, background: "rgba(8,11,17,.88)",
+      display: "grid", placeItems: "center", padding: 24, backdropFilter: "blur(6px)",
+    }}>
+      <div className="apex-pop" style={{ textAlign: "center", maxWidth: 320 }}>
+        <div style={{
+          width: 108, height: 108, borderRadius: 30, margin: "0 auto 22px",
+          background: `linear-gradient(150deg, ${ICE}, #3B7BD6)`, display: "grid", placeItems: "center",
+          fontFamily: "Archivo, Inter, sans-serif", fontWeight: 800, fontSize: 46, color: "#08121F",
+        }}>{level}</div>
+        <div className="apex-num" style={{ fontSize: 30, color: "#fff", letterSpacing: "-.03em" }}>{rankFor(level)}</div>
+        <div style={{ fontSize: 14, color: "#A6B3C7", marginTop: 8, lineHeight: 1.55 }}>
+          Level {level}. Next rank at {(RANKS.find(([m]) => m > level) || [100, "Apex"])[0]}.
+        </div>
+        <button onClick={onClose} style={{
+          marginTop: 24, background: XP_C, color: "#1A1206", border: "none", borderRadius: 12,
+          padding: "12px 26px", fontWeight: 700, fontSize: 14, cursor: "pointer",
+        }}>Keep going</button>
+      </div>
+    </div>
+  );
+}
+
+/* --------------------------------- styles -------------------------------- */
+
+function Styles() {
+  return (
+    <style>{`
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+.apex-num { font-family: Archivo, Inter, ui-sans-serif, system-ui, sans-serif; font-weight: 800; font-variant-numeric: tabular-nums; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid ${XP_C}; outline-offset: 2px; }
+input, textarea { outline: none; }
+::-webkit-scrollbar { height: 0; width: 0; }
+@keyframes apexPop { 0% { transform: scale(.7); opacity: .4 } 55% { transform: scale(1.12) } 100% { transform: scale(1); opacity: 1 } }
+@keyframes apexRise { from { transform: translateY(26px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+@keyframes apexToast { from { transform: translateY(14px); opacity: 0 } to { transform: translateY(0); opacity: 1 } }
+.apex-pop { animation: apexPop .42s cubic-bezier(.2,.9,.3,1.4); }
+.apex-rise { animation: apexRise .3s cubic-bezier(.2,.9,.3,1); }
+.apex-toast { animation: apexToast .28s ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .apex-pop, .apex-rise, .apex-toast { animation: none !important; }
+  * { transition-duration: .01ms !important; }
+}
+    `}</style>
+  );
+}
